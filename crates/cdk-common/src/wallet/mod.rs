@@ -486,6 +486,22 @@ impl fmt::Debug for ReceiveOptions {
     }
 }
 
+/// Offline Receive options
+///
+/// DLEQ proof verification is always performed for offline receives
+/// since it is the only way to verify token authenticity without
+/// contacting the mint.
+///
+/// The wallet is already bound to a specific mint URL, so mint
+/// filtering is handled automatically.
+#[derive(Debug, Clone, Default)]
+pub struct OfflineReceiveOptions {
+    /// Optional minimum locktime required for the token
+    pub minimum_locktime: Option<u64>,
+    /// Require the token to be P2PK locked
+    pub require_locked: bool,
+}
+
 /// Send Kind
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SendKind {
@@ -948,6 +964,16 @@ pub trait Wallet: Send + Sync {
         memo: Option<String>,
         token: Option<String>,
     ) -> Result<Self::Amount, Self::Error>;
+
+    /// Receive an encoded token offline without contacting the mint
+    async fn receive_offline(
+        &self,
+        encoded_token: &str,
+        options: OfflineReceiveOptions,
+    ) -> Result<Self::Amount, Self::Error>;
+
+    /// Finalize pending offline receives by attempting to swap them
+    async fn finalize_pending_receives(&self) -> Result<Self::Amount, Self::Error>;
 
     /// Prepare a send transaction
     async fn prepare_send(

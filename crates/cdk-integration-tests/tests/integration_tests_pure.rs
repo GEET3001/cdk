@@ -3697,3 +3697,190 @@ async fn test_p2pk_signing_keys_mixed_locked_and_unlocked_proofs() {
         "Bob should receive exactly the send amount"
     );
 }
+
+/// Tests the full offline receive lifecycle:
+///
+/// 1. Alice funds herself online and sends 40 sats to Carol as a token string.
+/// 2. Carol calls `receive_offline()` — no swap request is made to the Mint.
+///    Instead, the proofs are verified via DLEQ and stored as `PendingReceive`.
+/// 3. We verify that Carol's spendable balance is zero (proofs are not yet spendable)
+///    but proofs exist in `PendingReceive` state in the database.
+/// 4. Carol calls `finalize_pending_receives()` which swaps the proofs online,
+///    moving them to `Unspent` and making them fully spendable.
+#[tokio::test]
+async fn test_receive_offline_pending_then_finalize() {
+    setup_tracing();
+
+    let mint_bob = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+
+    let wallet_alice = create_test_wallet_for_mint(mint_bob.clone())
+        .await
+        .expect("Failed to create Alice's wallet");
+
+    // Alice gets 64 sats online
+    fund_wallet(wallet_alice.clone(), 64, None)
+        .await
+        .expect("Failed to fund Alice");
+
+    assert_eq!(
+        Amount::from(64),
+        wallet_alice.total_balance().await.unwrap()
+    );
+
+    // Alice prepares and confirms a send of 40 sats
+    let prepared = wallet_alice
+        .prepare_send(Amount::from(40), SendOptions::default())
+        .await
+        .expect("Failed to prepare send");
+
+    let token = prepared
+        .confirm(None)
+        .await
+        .expect("Failed to confirm send");
+
+    let token_str = token.to_string();
+
+    // Carol's wallet is connected to the same mint, so it has the keyset cached
+    let wallet_carol = create_test_wallet_for_mint(mint_bob.clone())
+        .await
+        .expect("Failed to create Carol's wallet");
+
+    // Carol receives offline — no swap is performed with the mint
+    let pending_amount = wallet_carol
+        .receive_offline(
+            &token_str,
+            cdk_common::wallet::OfflineReceiveOptions::default(),
+        )
+        .await
+        .expect("receive_offline should succeed with valid DLEQ proofs");
+
+    assert_eq!(
+        Amount::from(40),
+        pending_amount,
+        "receive_offline should return the token amount"
+    );
+
+    // Carol's spendable balance should still be zero — proofs are PendingReceive
+    assert_eq!(
+        Amount::ZERO,
+        wallet_carol.total_balance().await.unwrap(),
+        "Spendable balance should be zero until proofs are finalized"
+    );
+
+    // Verify the proofs are in PendingReceive state
+    let pending_proofs = wallet_carol
+        .get_proofs_by_states(vec![State::PendingReceive])
+        .await
+        .expect("Failed to get pending proofs");
+
+    assert!(
+        !pending_proofs.is_empty(),
+        "Proofs should be stored in PendingReceive state after offline receive"
+    );
+
+    // Carol comes back online and finalizes the pending receives
+    let finalized_amount = wallet_carol
+        .finalize_pending_receives()
+        .await
+        .expect("finalize_pending_receives should succeed");
+
+    assert_eq!(
+        Amount::from(40),
+        finalized_amount,
+        "finalize_pending_receives should return the finalized amount"
+    );
+
+    // Now Carol's balance should reflect the received funds
+    assert_eq!(
+        Amount::from(40),
+        wallet_carol.total_balance().await.unwrap(),
+        "Carol's balance should be 40 after finalizing"
+    );
+
+    // No proofs should remain in PendingReceive state
+    let still_pending = wallet_carol
+        .get_proofs_by_states(vec![State::PendingReceive])
+        .await
+        .expect("Failed to get pending proofs after finalization");
+
+    assert!(
+        still_pending.is_empty(),
+        "No proofs should remain in PendingReceive state after finalization"
+    );
+}
+
+/// Tests that `receive_offline` rejects tokens that do not carry DLEQ proofs.
+///
+/// DLEQ proofs are the *only* cryptographic guarantee available when offline.
+/// Without them, the wallet cannot verify token authenticity. This test
+/// ensures the function fails with `DleqProofNotProvided`.
+#[tokio::test]
+async fn test_receive_offline_rejects_token_without_dleq() {
+    setup_tracing();
+
+    let mint_bob = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+
+    let wallet_alice = create_test_wallet_for_mint(mint_bob.clone())
+        .await
+        .expect("Failed to create Alice's wallet");
+
+    // Alice gets 64 sats online
+    fund_wallet(wallet_alice.clone(), 64, None)
+        .await
+        .expect("Failed to fund Alice");
+
+    // Alice prepares and confirms a send of 10 sats
+    let prepared = wallet_alice
+        .prepare_send(Amount::from(10), SendOptions::default())
+        .await
+        .expect("Failed to prepare send");
+
+    let token = prepared
+        .confirm(None)
+        .await
+        .expect("Failed to confirm send");
+
+    // Manually strip DLEQ proofs from the token
+    let keysets_info = wallet_alice
+        .get_mint_keysets(KeysetFilter::Active)
+        .await
+        .unwrap();
+
+    let mut proofs = token.proofs(&keysets_info).unwrap();
+    for proof in &mut proofs {
+        proof.dleq = None;
+    }
+
+    let stripped_token = cashu::Token::new(
+        wallet_alice.mint_url.clone(),
+        proofs,
+        token.memo().clone(),
+        CurrencyUnit::Sat,
+    );
+
+    let wallet_carol = create_test_wallet_for_mint(mint_bob.clone())
+        .await
+        .expect("Failed to create Carol's wallet");
+
+    // Carol tries to receive offline — must fail because DLEQ is missing
+    let result = wallet_carol
+        .receive_offline(
+            &stripped_token.to_string(),
+            cdk_common::wallet::OfflineReceiveOptions::default(),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "receive_offline must reject tokens without DLEQ proofs"
+    );
+
+    match result.unwrap_err() {
+        cdk::Error::DleqProofNotProvided => {}
+        other => panic!("Expected DleqProofNotProvided error, got: {:?}", other),
+    }
+}
